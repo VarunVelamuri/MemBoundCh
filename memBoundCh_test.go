@@ -1,4 +1,4 @@
-package util
+package common 
 
 import "testing"
 import "unsafe"
@@ -22,11 +22,12 @@ func TestMemBoundCh(t *testing.T) {
 	}()
 
 	for i:=0; i< num; i++ {
-		memBoundCh.Push(a)
+		memBoundCh.Push(a, 8)
 	}
 	
 
 	time.Sleep(10 * time.Second)
+	memBoundCh.Close()
 	// Read the remaining elements from channel as channel is closed
 	if count != int32(num) {
 		fmt.Printf("Error, expected count: %v, actual count: %v\n", num, count)
