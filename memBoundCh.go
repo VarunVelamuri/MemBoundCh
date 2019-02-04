@@ -2,9 +2,8 @@ package common
 
 import (
 	"errors"
+	"sync"
 	atomic "sync/atomic"
-	"golang.org/x/sync/semaphore"
-	"context"
 )
 
 var ErrorChClosed = errors.New("MemBoundCh is closed")
@@ -16,9 +15,9 @@ type MemBoundCh struct {
 	size     int64
 	maxSize  int64
 	closed   int64
+	mu       sync.Mutex
+	notfull  *sync.Cond
 	waitFull int64
-	sema	 *semaphore.Weighted
-	cxt	context.Context
 }
 
 func NewMemBoundCh(count int64, size int64) *MemBoundCh {
@@ -29,9 +28,7 @@ func NewMemBoundCh(count int64, size int64) *MemBoundCh {
 		waitFull: 0,
 		closed:   0,
 	}
-	memBoundCh.cxt = context.TODO()
-	memBoundCh.sema = semaphore.NewWeighted(size)
-	memBoundCh.sema.Acquire(memBoundCh.cxt, size)
+	memBoundCh.notfull = sync.NewCond(&memBoundCh.mu)
 	return memBoundCh
 }
 
@@ -43,12 +40,16 @@ func (memBoundCh *MemBoundCh) GetChannel() chan interface{} {
 	return memBoundCh.ch
 }
 
-func (memBoundCh *MemBoundCh) IncrMaxSize(size int64) error {
+func (memBoundCh *MemBoundCh) SetMaxSize(size int64) error {
 	if size < 0 {
 		return ErrorInvSize //Error
 	}
 	atomic.StoreInt64(&memBoundCh.maxSize, size)
 	return nil
+}
+
+func (memBoundCh *MemBoundCh) GetMaxSize() int64 {
+	return atomic.LoadInt64(&memBoundCh.maxSize)
 }
 
 // Any read from channel should immediately be followed by DecrSize method
@@ -64,7 +65,12 @@ func (memBoundCh *MemBoundCh) DecrSize(size int64) error {
 		}
 		// New size is less than maxSize. Signal all threads that are waiting
 		if atomic.LoadInt64(&memBoundCh.waitFull) > 0 && atomic.LoadInt64(&memBoundCh.size) < atomic.LoadInt64(&memBoundCh.maxSize) {
-			memBoundCh.sema.Release(size)
+			// Using Signal() instead of Broadcast() here might be unfair in some cases
+			// E.g., Signal() wakes up only one go-routine which might require more memory than
+			// freed and therefore sleeps again. Other go-routines keep waiting even though
+			// there is space in the memBoundCh. Using Broadcast() will solve this problem but
+			// Broadcast is costly operation. Hence, going with Signal()
+			memBoundCh.notfull.Signal()
 			atomic.AddInt64(&memBoundCh.waitFull, -1)
 		}
 		return nil
@@ -72,22 +78,25 @@ func (memBoundCh *MemBoundCh) DecrSize(size int64) error {
 }
 
 func (memBoundCh *MemBoundCh) Push(elem interface{}, elemsz int64) error {
-	// Return error is the element size is greater than the max configured size
-	if elemsz > memBoundCh.maxSize {
-		return ErrorSize
-	}
 	for {
+		// Return error is the element size is greater than the max configured size
+		if elemsz > memBoundCh.GetMaxSize()  {
+			return ErrorSize
+		}
+
 		// Return error if the channel is closed
-		if memBoundCh.closed != 0 {
+		if atomic.LoadInt64(&memBoundCh.closed) != 0 {
 			return ErrorChClosed
 		}
 
 		currSize := memBoundCh.GetSize()
 		newSize := currSize + elemsz
-		if newSize > memBoundCh.maxSize {
+		if newSize > memBoundCh.GetMaxSize() {
 			// Wait for a not-full notification and retry the loop after the condition is satisfied
+			memBoundCh.mu.Lock()
 			atomic.AddInt64(&memBoundCh.waitFull, 1)
-			memBoundCh.sema.Acquire(memBoundCh.cxt,elemsz)
+			memBoundCh.notfull.Wait()
+			memBoundCh.mu.Unlock()
 			continue
 		} else {
 			// atomic.AddInt64 is used instead of CAS as CAS is a costly operation.
@@ -104,9 +113,10 @@ func (memBoundCh *MemBoundCh) Push(elem interface{}, elemsz int64) error {
 
 func (memBoundCh *MemBoundCh) Close() {
 	if atomic.LoadInt64(&memBoundCh.closed) == 0 {
-		memBoundCh.closed = 1
+		atomic.StoreInt64(&memBoundCh.closed, 1)
 		// Signal all waiting threads that the channels is closed
-		memBoundCh.sema.Release(memBoundCh.maxSize)
+		memBoundCh.notfull.Broadcast()
+		atomic.StoreInt64(&memBoundCh.waitFull, 0)
 		close(memBoundCh.ch)
 	}
 }
