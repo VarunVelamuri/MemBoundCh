@@ -70,6 +70,9 @@ func (memBoundCh *MemBoundCh) DecrSize(size int64) error {
 			// freed and therefore sleeps again. Other go-routines keep waiting even though
 			// there is space in the memBoundCh. Using Broadcast() will solve this problem but
 			// Broadcast is costly operation. Hence, going with Signal()
+			//
+			// Also, almost all of the usecases for MemBoundCh are single producer, single consumer channels
+			// So, signal() is sufficient
 			memBoundCh.notfull.Signal()
 			atomic.AddInt64(&memBoundCh.waitFull, -1)
 		}
@@ -80,7 +83,7 @@ func (memBoundCh *MemBoundCh) DecrSize(size int64) error {
 func (memBoundCh *MemBoundCh) Push(elem interface{}, elemsz int64) error {
 	for {
 		// Return error is the element size is greater than the max configured size
-		if elemsz > memBoundCh.GetMaxSize()  {
+		if elemsz > memBoundCh.GetMaxSize() {
 			return ErrorSize
 		}
 
