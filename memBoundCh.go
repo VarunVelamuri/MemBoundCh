@@ -1,3 +1,46 @@
+//*********************************************
+// MemBoundCh is a wrapper around golang channels
+//
+// MemBoundCh blocks when the total size of all elements (in bytes) in the
+// underlying channel exceeds the configured size (or) when the number
+// of elements in the underlying channel exceeds the configured count
+//
+// MemBoundCh is currently optimized for
+//	a. Single producer, single consumer scenarios
+//	b. Single producer, multiple consumer scenarios
+//
+// In multiple producer, single consumer scenarios, it can happen that
+// consumer signals a producer but producer falls back to wait if the size
+// of element it needs to push is greater than available size (Because of using
+// signal() instead of broadcast()). This might induce temporary blocking on the
+// producer's side as they keep waiting even when some space is available.
+// This is a temporary phenomemon as the data in underlying channel gets consumed
+// eventually and signal() does not wake-up the same producer always (i.e. giving
+// chance for other producers to do a Push() on the channel)
+//
+// It is the responsibility of the caller to handle
+//	a. ErrorChClosed - The channel is closed. The caller should either refrain from
+//			   pushing elements into the channel (or) create a new MemBoundCh,
+//			   consume all the elements remaining in old channel, push them to
+//			   new MemBoundCh and then continue to push new elements. The 
+//			   creation of new MemBoundCh has to be lock protected as the caller
+//			   can simultanesouly handle "ErrorInvSize" simultaneously in a 
+//			   separate thread
+//	b. ErrorSize - The size of the element that is being pushed is greater than
+//		       the maximum size the channel can hold. Increase the MemBoundCh
+//		       maxSize to handle this error
+//	c. ErrorInvMaxSize - The total size of all the elements in MemBoundCh should not
+//			     be configured less than "0". Increase the MemBoundCh maxSize
+//			     to handle this error
+//	d. ErrorInvSize - This can happens when the DecrSize() method is called more than once
+//			  for the same element (If this situation arises, then it means that the
+//			  code has a bug). As a recovery, the caller can close the existing 
+//			  MemBoundCh, create a new MemBoundCh, consume all the elements remaining
+//			  in old channel, push them to new MemBoundCh. The creation of new
+//			  MemBoundCh has to be lock protected as the caller can simultaneously 
+//			  handle "ErrorChClosed" in a separate thread
+//
+//*********************************************
 package common
 
 import (
@@ -8,7 +51,8 @@ import (
 
 var ErrorChClosed = errors.New("MemBoundCh is closed")
 var ErrorSize = errors.New("Element size is more than max allowed channel size")
-var ErrorInvSize = errors.New("Max allowed channel size should always be greater than 0")
+var ErrorInvMaxSize = errors.New("Max allowed channel size should always be greater than 0")
+var ErrorInvSize = errors.New("Total size of all the elements can not go below zero")
 
 type MemBoundCh struct {
 	ch       chan interface{}
@@ -42,7 +86,7 @@ func (memBoundCh *MemBoundCh) GetChannel() chan interface{} {
 
 func (memBoundCh *MemBoundCh) SetMaxSize(size int64) error {
 	if size < 0 {
-		return ErrorInvSize //Error
+		return ErrorInvMaxSize //Error
 	}
 	atomic.StoreInt64(&memBoundCh.maxSize, size)
 	return nil
@@ -60,19 +104,22 @@ func (memBoundCh *MemBoundCh) DecrSize(size int64) error {
 		return nil
 	} else {
 		atomic.AddInt64(&memBoundCh.size, 0-size)
-		if atomic.LoadInt64(&memBoundCh.size) < 0 {
+		if memBoundCh.GetSize() < 0 {
 			return ErrorInvSize
 		}
 		// New size is less than maxSize. Signal all threads that are waiting
-		if atomic.LoadInt64(&memBoundCh.waitFull) > 0 && atomic.LoadInt64(&memBoundCh.size) < atomic.LoadInt64(&memBoundCh.maxSize) {
+		// Due to AddInt64 while doing Push, the memBoundCh.size can go beyond 
+		// memBoundCh.maxSize. Hence, signal only if the size comes down below 
+		// memBoundCh.maxSize
+		if atomic.LoadInt64(&memBoundCh.waitFull) > 0 && atomic.LoadInt64(&memBoundCh.size) < memBoundCh.GetMaxSize() {
 			// Using Signal() instead of Broadcast() here might be unfair in some cases
 			// E.g., Signal() wakes up only one go-routine which might require more memory than
 			// freed and therefore sleeps again. Other go-routines keep waiting even though
 			// there is space in the memBoundCh. Using Broadcast() will solve this problem but
-			// Broadcast is costly operation. Hence, going with Signal()
-			//
-			// Also, almost all of the usecases for MemBoundCh are single producer, single consumer channels
-			// So, signal() is sufficient
+			// Broadcast is costly operation. This producer blocking is a temporary phenomenon
+			// as the data in underlying channel gets consumed eventually and signal() does not
+			// wake-up the same producer always (i.e. giving chance for other producers to do a 
+			// Push() on the channel)
 			memBoundCh.notfull.Signal()
 			atomic.AddInt64(&memBoundCh.waitFull, -1)
 		}
@@ -115,8 +162,8 @@ func (memBoundCh *MemBoundCh) Push(elem interface{}, elemsz int64) error {
 }
 
 func (memBoundCh *MemBoundCh) Close() {
-	if atomic.LoadInt64(&memBoundCh.closed) == 0 {
-		atomic.StoreInt64(&memBoundCh.closed, 1)
+	// Only one thread should succeed in closing the channels
+	if atomic.CompareAndSwapInt64(&memBoundCh.closed, 0, 1) {
 		// Signal all waiting threads that the channels is closed
 		memBoundCh.notfull.Broadcast()
 		atomic.StoreInt64(&memBoundCh.waitFull, 0)
