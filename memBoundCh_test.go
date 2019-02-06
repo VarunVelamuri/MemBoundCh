@@ -10,7 +10,8 @@ import (
 //This test should be improved further
 func TestMemBoundCh(t *testing.T) {
 	// 1000 elements, 128 bytes
-	memBoundCh := NewMemBoundCh(1000, 128)
+	size := int64(128)
+	memBoundCh := NewMemBoundCh(1000, &size)
 	a := "12345678"
 	var count int
 	num := 1000

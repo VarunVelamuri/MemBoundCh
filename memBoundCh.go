@@ -57,14 +57,14 @@ var ErrorInvSize = errors.New("Total size of all the elements can not go below z
 type MemBoundCh struct {
 	ch       chan interface{}
 	size     int64
-	maxSize  int64
+	maxSize  *int64
 	closed   int64
 	mu       sync.Mutex
 	notfull  *sync.Cond
 	waitFull int64
 }
 
-func NewMemBoundCh(count int64, size int64) *MemBoundCh {
+func NewMemBoundCh(count int64, size *int64) *MemBoundCh {
 	memBoundCh := &MemBoundCh{
 		ch:       make(chan interface{}, count),
 		maxSize:  size,
@@ -88,12 +88,12 @@ func (memBoundCh *MemBoundCh) SetMaxSize(size int64) error {
 	if size < 0 {
 		return ErrorInvMaxSize //Error
 	}
-	atomic.StoreInt64(&memBoundCh.maxSize, size)
+	atomic.StoreInt64(memBoundCh.maxSize, size)
 	return nil
 }
 
 func (memBoundCh *MemBoundCh) GetMaxSize() int64 {
-	return atomic.LoadInt64(&memBoundCh.maxSize)
+	return atomic.LoadInt64(memBoundCh.maxSize)
 }
 
 // Any read from channel should immediately be followed by DecrSize method
